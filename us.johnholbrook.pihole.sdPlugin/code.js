@@ -16,37 +16,70 @@ function log(message){
     });
 }
 
+function getPiholes(settings){
+    const r = [];
+    const keys = settings.ph_key.split(',');
+    for(const [i, ph_addr] in settings.ph_addr.split(",")){
+        const ph_key = keys[i];
+        r.append({ph_addr, ph_key});
+    }
+    return r;
+}
+
 // make a call to enable or disable pi-hole
 function callPiHole(settings, cmd){
-    let req_addr = `${settings.protocol}://${settings.ph_addr}/admin/api.php?${cmd}&auth=${settings.ph_key}`;
-    // log(`call request to ${req_addr}`);
-    let xhr = new XMLHttpRequest();
-    xhr.open("GET", req_addr);
-    xhr.send();
+    for(const pi in getPiholes(settings)){
+        const {ph_addr, ph_key} = pi;
+        let req_addr = `${settings.protocol}://${ph_addr}/admin/api.php?${cmd}&auth=${ph_key}`;
+        // log(`call request to ${req_addr}`);
+        let xhr = new XMLHttpRequest();
+        xhr.open("GET", req_addr);
+        xhr.send();
+    }
 }
 
 // get the status of the pi-hole (enabled/disabled, stats, etc.) and pass to a handler function
 function get_ph_status(settings, handler){
-    let req_addr = `${settings.protocol}://${settings.ph_addr}/admin/api.php?summaryRaw&auth=${settings.ph_key}`;
-    // log(`get_status request to ${req_addr}`);
-    let xhr = new XMLHttpRequest();
-    xhr.open("GET", req_addr);
-    xhr.onload = function(){
-        data = JSON.parse(xhr.response);
-        handler(data);
+    const piholes = getPiholes(settings);
+    const check_finished = () => {
+        if(loaded_cache.keys().length >= piholes.length){
+            handler(loaded_cache.values());
+        }
+    };
+    const loaded_cache = {};
+    const loaded = (
+        ph_addr,
+        error,
+        json_loaded
+    ) => {
+        loaded_cache[ph_addr] = {ph_addr, error, json_loaded};
+        check_finished();
+    };
+    for(const pi in piholes) {
+        const {ph_addr, ph_key} = pi;
+        let req_addr = `${settings.protocol}://${ph_addr}/admin/api.php?summaryRaw&auth=${ph_key}`;
+        // log(`get_status request to ${req_addr}`);
+        let xhr = new XMLHttpRequest();
+        xhr.open("GET", req_addr);
+        xhr.onload = function () {
+            data = JSON.parse(xhr.response);
+            loaded(ph_addr, false, data);
+        }
+        xhr.onerror = function () {
+            loaded(ph_addr, true, {"error": `couldn't reach Pi-hole: ${ph_addr}`});
+        }
+        xhr.send();
     }
-    xhr.onerror = function(){
-        handler({"error": "couldn't reach Pi-hole"});
-    }
-    xhr.send();
 }
 
 // event handler for us.johnholbrook.pihole.temporarily-disable
 function temporarily_disable(context){
     let settings = instances[context].settings;
-    get_ph_status(settings, response => {
-        if (response.status == "enabled"){  // it only makes sense to temporarily disable p-h if it's currently enabled
-            callPiHole(settings, `disable=${settings.disable_time}`)
+    get_ph_status(settings, responses => {
+        for(let response in responses){
+            if (response.status == "enabled"){  // it only makes sense to temporarily disable p-h if it's currently enabled
+                callPiHole(settings, `disable=${settings.disable_time}`)
+            }
         }
     });
 }
@@ -54,14 +87,16 @@ function temporarily_disable(context){
 // event handler for us.johnholbrook.pihole.toggle
 function toggle(context){
     let settings = instances[context].settings;
-    get_ph_status(settings, response => {
-        if (response.status == "disabled"){
-            callPiHole(settings, "enable");
-            setState(context, 0);
-        }
-        else if (response.status == "enabled"){
-            callPiHole(settings, "disable");
-            setState(context, 1);
+    get_ph_status(settings, responses => {
+        for(let response in responses){
+            if (response.status == "disabled"){
+                callPiHole(settings, "enable");
+                setState(context, 0);
+            }
+            else if (response.status == "enabled"){
+                callPiHole(settings, "disable");
+                setState(context, 1);
+            }
         }
     });
 }
@@ -82,38 +117,40 @@ function enable(context){
 // (called once per second per instance)
 function pollPihole(context){
     let settings = instances[context].settings;
-    get_ph_status(settings, response => {
-        if ("error" in response){ // couldn't reach p-h, display a warning
-            // log(`${instances[context].action} error`)
-            send({
-                "event": "showAlert",
-                "context": context
-            });
-            log(response);
-        }
-        else{
-            // set state according to whether p-h is enabled or disabled
-            if (response.status == "disabled" && settings.show_status){
-                // log(`${instances[context].action} offline`);
-                setState(context, 1);
-            }
-            else if (response.status == "enabled" && settings.show_status){
-                // log(`${instances[context].action} online`);
-                setState(context, 0);
-            }
-
-            // display stat, if desired
-            if (settings.stat != "none"){
-                // let stat = String(response[settings.stat]);
-                let stat = process_stat(response[settings.stat], settings.stat);
-                // log(stat);
+    get_ph_status(settings, responses => {
+        for(let response in responses){
+            if ("error" in response){ // couldn't reach p-h, display a warning
+                // log(`${instances[context].action} error`)
                 send({
-                    "event": "setTitle",
-                    "context": context,
-                    "payload": {
-                        "title": stat
-                    }
+                    "event": "showAlert",
+                    "context": context
                 });
+                log(response);
+            }
+            else{
+                // set state according to whether p-h is enabled or disabled
+                if (response.status == "disabled" && settings.show_status){
+                    // log(`${instances[context].action} offline`);
+                    setState(context, 1);
+                }
+                else if (response.status == "enabled" && settings.show_status){
+                    // log(`${instances[context].action} online`);
+                    setState(context, 0);
+                }
+
+                // display stat, if desired
+                if (settings.stat != "none"){
+                    // let stat = String(response[settings.stat]);
+                    let stat = process_stat(response[settings.stat], settings.stat);
+                    // log(stat);
+                    send({
+                        "event": "setTitle",
+                        "context": context,
+                        "payload": {
+                            "title": stat
+                        }
+                    });
+                }
             }
         }
     });
@@ -158,7 +195,7 @@ function updateSettings(payload){
 // write settings
 function writeSettings(context, action, settings){
     // write the settings
-    if (!(context in instances)){ 
+    if (!(context in instances)){
         instances[context] = {"action": action};
     }
     instances[context].settings = settings;
